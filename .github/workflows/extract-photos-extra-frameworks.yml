@@ -1,0 +1,542 @@
+name: Extract Photos Extra Frameworks
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "Direct Apple IPSW URL"
+        required: true
+        default: "https://updates.cdn-apple.com/2026FallFCS/d47bac10-cddf-4f79-a014-411e2fea1fdb/iPhone12%2C1_27.0_24A437_Restore.ipsw"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: photos-extra-frameworks
+  cancel-in-progress: true
+
+jobs:
+  extract:
+    name: Extract Photos Extra Framework Implementations
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Show disk space
+        run: df -h
+
+      - name: Install latest ipsw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/blacktop/ipsw/releases/latest \
+            | jq -r '.tag_name' \
+            | sed 's/^v//'
+          )"
+
+          echo "Installing ipsw ${VERSION}"
+
+          curl -fL \
+            "https://github.com/blacktop/ipsw/releases/latest/download/ipsw_${VERSION}_linux_x86_64.tar.gz" \
+            -o /tmp/ipsw.tar.gz
+
+          tar -xzf /tmp/ipsw.tar.gz -C /tmp
+
+          sudo install -m 0755 \
+            /tmp/ipsw \
+            /usr/local/bin/ipsw
+
+          ipsw version
+
+      - name: Install APFS support
+        env:
+          APFS_FUSE_SHA: 66b86bd525e8cb90f9012543be89b1f092b75cf3
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 \
+            libfuse3-dev \
+            libbz2-dev \
+            libattr1-dev \
+            zlib1g-dev \
+            cmake \
+            g++ \
+            git
+
+          SRC="$RUNNER_TEMP/apfs-fuse"
+
+          git clone --quiet \
+            https://github.com/sgan81/apfs-fuse.git \
+            "$SRC"
+
+          git -C "$SRC" checkout --quiet "$APFS_FUSE_SHA"
+
+          git -C "$SRC" \
+            submodule update \
+            --init \
+            --recursive \
+            --quiet
+
+          cmake \
+            -S "$SRC" \
+            -B "$SRC/build" \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake \
+            --build "$SRC/build" \
+            --parallel "$(nproc)"
+
+          sudo install -m 0755 \
+            "$SRC/build/apfs-fuse" \
+            /usr/local/bin/apfs-fuse
+
+          command -v apfs-fuse
+
+      - name: Create working directories
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/dsc"
+          mkdir -p "$GITHUB_WORKSPACE/frameworks"
+          mkdir -p "$GITHUB_WORKSPACE/framework-resources"
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          mkdir -p "$GITHUB_WORKSPACE/package"
+
+      - name: Extract arm64e dyld shared cache
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set -euo pipefail
+
+          ipsw extract \
+            --remote \
+            --device iPhone12,1 \
+            --dyld \
+            --dyld-arch arm64e \
+            --output "$GITHUB_WORKSPACE/dsc" \
+            "$IPSW_URL"
+
+          echo
+          echo "=== Extracted DSC files ==="
+
+          find "$GITHUB_WORKSPACE/dsc" \
+            -maxdepth 8 \
+            -type f \
+            -print
+
+      - name: Locate primary dyld cache
+        id: cache
+        run: |
+          set -euo pipefail
+
+          CACHE="$(
+            find "$GITHUB_WORKSPACE/dsc" \
+              -type f \
+              -name 'dyld_shared_cache_arm64e' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$CACHE" ]; then
+            echo "ERROR: Primary arm64e cache not found."
+            find "$GITHUB_WORKSPACE/dsc" -type f -print
+            exit 1
+          fi
+
+          echo "Primary cache:"
+          echo "$CACHE"
+
+          echo "cache_path=$CACHE" >> "$GITHUB_OUTPUT"
+
+      - name: Inventory extra framework images
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set -euo pipefail
+
+          ipsw dyld info "$CACHE" \
+            > "$GITHUB_WORKSPACE/evidence/DYLD_FULL_IMAGE_LIST.txt"
+
+          echo "=== Matching image paths ==="
+
+          grep -Ei \
+            'PhotosUIFoundation|PhotosSwiftUICore|PhotosUIComponents' \
+            "$GITHUB_WORKSPACE/evidence/DYLD_FULL_IMAGE_LIST.txt" \
+            | tee "$GITHUB_WORKSPACE/evidence/TARGET_FRAMEWORKS_IN_DSC.txt" \
+            || true
+
+      - name: Extract extra framework Mach-Os
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set -euo pipefail
+
+          : > "$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt"
+
+          NAMES=(
+            "PhotosUIFoundation"
+            "PhotosSwiftUICore"
+            "PhotosUIComponents"
+          )
+
+          for NAME in "${NAMES[@]}"; do
+
+            case "$NAME" in
+
+              PhotosUIFoundation)
+                IMAGE="/System/Library/PrivateFrameworks/PhotosUIFoundation.framework/PhotosUIFoundation"
+                ;;
+
+              PhotosSwiftUICore)
+                IMAGE="/System/Library/PrivateFrameworks/PhotosSwiftUICore.framework/PhotosSwiftUICore"
+                ;;
+
+              PhotosUIComponents)
+                IMAGE="/System/Library/PrivateFrameworks/PhotosUIComponents.framework/PhotosUIComponents"
+                ;;
+
+            esac
+
+            echo
+            echo "======================================"
+            echo "Extracting: $NAME"
+            echo "Image:      $IMAGE"
+            echo "======================================"
+
+            mkdir -p \
+              "$GITHUB_WORKSPACE/frameworks/$NAME"
+
+            if ipsw dyld extract \
+              "$CACHE" \
+              "$IMAGE" \
+              --objc \
+              --stubs \
+              --force \
+              --output "$GITHUB_WORKSPACE/frameworks/$NAME"
+            then
+
+              echo "$NAME: EXTRACTED" \
+                | tee -a "$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt"
+
+            else
+
+              echo "$NAME: NOT FOUND / EXTRACTION FAILED" \
+                | tee -a "$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt"
+
+            fi
+
+          done
+
+          echo
+          echo "=== Extraction status ==="
+
+          cat \
+            "$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt"
+
+      - name: Verify extracted binaries
+        run: |
+          set -euo pipefail
+
+          {
+            echo "=== EXTRACTED FILES ==="
+            echo
+
+            find "$GITHUB_WORKSPACE/frameworks" \
+              -type f \
+              -print
+
+            echo
+            echo "=== FILE TYPES ==="
+            echo
+
+            find "$GITHUB_WORKSPACE/frameworks" \
+              -type f \
+              -print0 \
+            | while IFS= read -r -d '' FILE; do
+                echo "--------------------------------------"
+                echo "$FILE"
+                file "$FILE" || true
+              done
+
+          } | tee \
+            "$GITHUB_WORKSPACE/evidence/EXTRACTED_BINARY_VERIFICATION.txt"
+
+      - name: Generate deep framework evidence
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          NAMES=(
+            "PhotosUIFoundation"
+            "PhotosSwiftUICore"
+            "PhotosUIComponents"
+          )
+
+          for NAME in "${NAMES[@]}"; do
+
+            case "$NAME" in
+
+              PhotosUIFoundation)
+                IMAGE="/System/Library/PrivateFrameworks/PhotosUIFoundation.framework/PhotosUIFoundation"
+                ;;
+
+              PhotosSwiftUICore)
+                IMAGE="/System/Library/PrivateFrameworks/PhotosSwiftUICore.framework/PhotosSwiftUICore"
+                ;;
+
+              PhotosUIComponents)
+                IMAGE="/System/Library/PrivateFrameworks/PhotosUIComponents.framework/PhotosUIComponents"
+                ;;
+
+            esac
+
+            echo
+            echo "======================================"
+            echo "Analyzing: $NAME"
+            echo "Image:     $IMAGE"
+            echo "======================================"
+
+            ipsw dyld macho \
+              "$CACHE" \
+              "$IMAGE" \
+              --loads \
+              --objc \
+              --objc-refs \
+              --symbols \
+              --strings \
+              --swift \
+              --swift-all \
+              > "$GITHUB_WORKSPACE/evidence/${NAME}_FULL_ANALYSIS.txt" \
+              2>&1
+
+            STATUS=$?
+
+            if [ "$STATUS" -eq 0 ]; then
+              echo "$NAME: ANALYSIS OK"
+            else
+              echo "$NAME: ANALYSIS RETURNED STATUS $STATUS"
+            fi
+
+          done
+
+          exit 0
+
+      - name: Generate focused architecture evidence
+        run: |
+          set -euo pipefail
+
+          OUTPUT="$GITHUB_WORKSPACE/evidence/PHOTOS_EXTRA_ARCHITECTURE_EVIDENCE.txt"
+
+          : > "$OUTPUT"
+
+          for FILE in \
+            "$GITHUB_WORKSPACE/evidence/PhotosUIFoundation_FULL_ANALYSIS.txt" \
+            "$GITHUB_WORKSPACE/evidence/PhotosSwiftUICore_FULL_ANALYSIS.txt" \
+            "$GITHUB_WORKSPACE/evidence/PhotosUIComponents_FULL_ANALYSIS.txt"
+          do
+
+            if [ ! -f "$FILE" ]; then
+              continue
+            fi
+
+            echo "" >> "$OUTPUT"
+            echo "======================================" >> "$OUTPUT"
+            echo "SOURCE: $(basename "$FILE")" >> "$OUTPUT"
+            echo "======================================" >> "$OUTPUT"
+
+            grep -Ei \
+              'PXSectionedSelectionManager|PXSelectionCoordinator|PXSelectionSnapshot|PhotosSelection|selectionManager|selectionGeometry|PXStepZoomInteractionViewModel|zoomStep|interactiveZoom|zoomLevel|setZoomLevel|transitionToZoomLevel|anchor|focal|PXAssetReference|currentAsset|OneUp|OneUpChrome|Scrubber|scrubber|filmstrip|paging|pageSwipe|transitionProgress|interactiveTransition|Animator|LayoutMetricInterpolator|PXObservation|AnyPhotosObservable|contentOffset|visibleRect|layoutTransition' \
+              "$FILE" \
+              >> "$OUTPUT" \
+              || true
+
+          done
+
+          echo
+          echo "=== Focused evidence line count ==="
+
+          wc -l "$OUTPUT"
+
+      - name: Extract framework resource folders
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set +e
+
+          ipsw extract \
+            --remote \
+            --device iPhone12,1 \
+            --files \
+            --pattern '.*(PhotosUIFoundation|PhotosSwiftUICore|PhotosUIComponents)\.framework/.*' \
+            --output "$GITHUB_WORKSPACE/framework-resources" \
+            "$IPSW_URL"
+
+          STATUS=$?
+
+          echo
+          echo "Resource extraction status: $STATUS"
+
+          exit 0
+
+      - name: Build reference inventory
+        run: |
+          set -euo pipefail
+
+          INFO="$GITHUB_WORKSPACE/evidence/REFERENCE_INFO.txt"
+
+          {
+            echo "APPLE PHOTOS EXTRA FRAMEWORK REFERENCE"
+            echo
+            echo "Device: iPhone 11"
+            echo "Product: iPhone12,1"
+            echo "OS: iOS 27.0"
+            echo "Build: 24A437"
+            echo
+            echo "Targets:"
+            echo "- PhotosUIFoundation"
+            echo "- PhotosSwiftUICore"
+            echo "- PhotosUIComponents"
+            echo
+            echo "Selected images:"
+            echo "/System/Library/PrivateFrameworks/PhotosUIFoundation.framework/PhotosUIFoundation"
+            echo "/System/Library/PrivateFrameworks/PhotosSwiftUICore.framework/PhotosSwiftUICore"
+            echo "/System/Library/PrivateFrameworks/PhotosUIComponents.framework/PhotosUIComponents"
+            echo
+            echo "=== EXTRACTION STATUS ==="
+
+            cat \
+              "$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt" \
+              || true
+
+            echo
+            echo "=== EXTRACTED BINARIES ==="
+
+            find "$GITHUB_WORKSPACE/frameworks" \
+              -type f \
+              -exec ls -lh {} \;
+
+            echo
+            echo "=== RESOURCE FILES ==="
+
+            find "$GITHUB_WORKSPACE/framework-resources" \
+              -type f \
+              -print \
+              || true
+
+          } > "$INFO"
+
+          cat "$INFO"
+
+      - name: Validate all three extra frameworks
+        run: |
+          set -euo pipefail
+
+          STATUS_FILE="$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt"
+
+          echo
+          echo "=== FINAL VALIDATION ==="
+
+          cat "$STATUS_FILE"
+
+          REQUIRED=(
+            "PhotosUIFoundation"
+            "PhotosSwiftUICore"
+            "PhotosUIComponents"
+          )
+
+          FAILED=0
+
+          for NAME in "${REQUIRED[@]}"; do
+
+            if grep -Fxq \
+              "$NAME: EXTRACTED" \
+              "$STATUS_FILE"
+            then
+
+              echo "PASS: $NAME"
+
+            else
+
+              echo "FAIL: $NAME"
+              FAILED=1
+
+            fi
+
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo
+            echo "One or more extra frameworks failed extraction."
+            exit 1
+          fi
+
+          echo
+          echo "ALL THREE EXTRA FRAMEWORKS EXTRACTED"
+
+      - name: Package extra framework reference
+        run: |
+          set -euo pipefail
+
+          rm -rf "$GITHUB_WORKSPACE/package"
+          mkdir -p "$GITHUB_WORKSPACE/package"
+
+          cp -a \
+            "$GITHUB_WORKSPACE/frameworks" \
+            "$GITHUB_WORKSPACE/package/"
+
+          cp -a \
+            "$GITHUB_WORKSPACE/framework-resources" \
+            "$GITHUB_WORKSPACE/package/"
+
+          cp -a \
+            "$GITHUB_WORKSPACE/evidence" \
+            "$GITHUB_WORKSPACE/package/"
+
+          cd "$GITHUB_WORKSPACE/package"
+
+          zip -qry \
+            "$GITHUB_WORKSPACE/Apple_Photos_ExtraFrameworks_iOS27_24A437.zip" \
+            .
+
+          cd "$GITHUB_WORKSPACE"
+
+          sha256sum \
+            Apple_Photos_ExtraFrameworks_iOS27_24A437.zip \
+            > Apple_Photos_ExtraFrameworks_iOS27_24A437.zip.sha256
+
+          echo
+          echo "=== FINAL PACKAGE ==="
+
+          ls -lh \
+            Apple_Photos_ExtraFrameworks_iOS27_24A437.zip
+
+          echo
+          echo "=== SHA-256 ==="
+
+          cat \
+            Apple_Photos_ExtraFrameworks_iOS27_24A437.zip.sha256
+
+      - name: Upload extra framework reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_Photos_ExtraFrameworks_iOS27_24A437
+          path: |
+            Apple_Photos_ExtraFrameworks_iOS27_24A437.zip
+            Apple_Photos_ExtraFrameworks_iOS27_24A437.zip.sha256
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Final disk space
+        if: always()
+        run: df -h

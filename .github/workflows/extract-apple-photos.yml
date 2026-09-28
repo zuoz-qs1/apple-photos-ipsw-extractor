@@ -1,0 +1,144 @@
+name: Extract Apple Photos from IPSW
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "Direct Apple IPSW URL"
+        required: true
+        default: "https://updates.cdn-apple.com/2026FallFCS/d47bac10-cddf-4f79-a014-411e2fea1fdb/iPhone12%2C1_27.0_24A437_Restore.ipsw"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-photos-extract
+  cancel-in-progress: true
+
+jobs:
+  extract:
+    name: Extract Photos.app
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Show disk space
+        run: df -h
+
+      - name: Install latest ipsw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/blacktop/ipsw/releases/latest \
+            | jq -r '.tag_name' \
+            | sed 's/^v//'
+          )"
+
+          echo "Installing ipsw ${VERSION}"
+
+          curl -fL \
+            "https://github.com/blacktop/ipsw/releases/latest/download/ipsw_${VERSION}_linux_x86_64.tar.gz" \
+            -o /tmp/ipsw.tar.gz
+
+          tar -xzf /tmp/ipsw.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/ipsw /usr/local/bin/ipsw
+
+          ipsw --help >/dev/null
+          echo "ipsw installed"
+
+      - name: Extract Apple Photos
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/extracted"
+
+          ipsw extract \
+            --remote \
+            --files \
+            --pattern '.*(staged_system_apps/Photos\.app|Applications/Photos\.app|Applications/MobileSlideShow\.app)/.*' \
+            --output "$GITHUB_WORKSPACE/extracted" \
+            "$IPSW_URL"
+
+      - name: Locate Photos.app
+        id: locate
+        run: |
+          set -euo pipefail
+
+          APP="$(
+            find "$GITHUB_WORKSPACE/extracted" \
+              -type d \
+              \( -name 'Photos.app' -o -name 'MobileSlideShow.app' \) \
+              -print -quit
+          )"
+
+          if [ -z "$APP" ]; then
+            echo "Photos.app was not found."
+            echo "Extracted paths:"
+            find "$GITHUB_WORKSPACE/extracted" -maxdepth 8 -print | head -300
+            exit 1
+          fi
+
+          echo "Found Photos bundle:"
+          echo "$APP"
+
+          du -sh "$APP"
+
+          echo "app_path=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Build reference package
+        env:
+          APP_PATH: ${{ steps.locate.outputs.app_path }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/package"
+
+          cp -a "$APP_PATH" "$GITHUB_WORKSPACE/package/"
+
+          cat > "$GITHUB_WORKSPACE/package/EXTRACTION_INFO.txt" <<'EOF'
+          Source device: iPhone 11 (iPhone12,1)
+          Source OS: iOS 27.0
+          Build: 24A437
+          Source: Official Apple IPSW
+          Purpose: Apple Photos binary/resource reference
+          Extractor: blacktop/ipsw
+          Runner: GitHub Actions ubuntu-latest
+          EOF
+
+          cd "$GITHUB_WORKSPACE/package"
+
+          zip -qry \
+            "$GITHUB_WORKSPACE/Apple_Photos_iOS27_24A437_Reference.zip" \
+            .
+
+          cd "$GITHUB_WORKSPACE"
+
+          sha256sum \
+            Apple_Photos_iOS27_24A437_Reference.zip \
+            > Apple_Photos_iOS27_24A437_Reference.zip.sha256
+
+          ls -lh Apple_Photos_iOS27_24A437_Reference.zip
+          cat Apple_Photos_iOS27_24A437_Reference.zip.sha256
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_Photos_iOS27_24A437_Reference
+          path: |
+            Apple_Photos_iOS27_24A437_Reference.zip
+            Apple_Photos_iOS27_24A437_Reference.zip.sha256
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Final disk space
+        if: always()
+        run: df -h

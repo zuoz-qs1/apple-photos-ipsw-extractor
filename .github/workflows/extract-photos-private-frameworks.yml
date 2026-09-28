@@ -1,0 +1,342 @@
+name: Extract Photos Private Frameworks
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "Direct Apple IPSW URL"
+        required: true
+        default: "https://updates.cdn-apple.com/2026FallFCS/d47bac10-cddf-4f79-a014-411e2fea1fdb/iPhone12%2C1_27.0_24A437_Restore.ipsw"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: photos-private-frameworks
+  cancel-in-progress: true
+
+jobs:
+  extract:
+    name: Extract Photos Framework Implementations
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Show disk space
+        run: df -h
+
+      - name: Install latest ipsw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/blacktop/ipsw/releases/latest \
+            | jq -r '.tag_name' \
+            | sed 's/^v//'
+          )"
+
+          echo "Installing ipsw ${VERSION}"
+
+          curl -fL \
+            "https://github.com/blacktop/ipsw/releases/latest/download/ipsw_${VERSION}_linux_x86_64.tar.gz" \
+            -o /tmp/ipsw.tar.gz
+
+          tar -xzf /tmp/ipsw.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/ipsw /usr/local/bin/ipsw
+
+          ipsw version
+
+      - name: Install APFS support
+        env:
+          APFS_FUSE_SHA: 66b86bd525e8cb90f9012543be89b1f092b75cf3
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 \
+            libfuse3-dev \
+            libbz2-dev \
+            libattr1-dev \
+            zlib1g-dev \
+            cmake \
+            g++ \
+            git
+
+          SRC="$RUNNER_TEMP/apfs-fuse"
+
+          git clone --quiet \
+            https://github.com/sgan81/apfs-fuse.git \
+            "$SRC"
+
+          git -C "$SRC" checkout --quiet "$APFS_FUSE_SHA"
+          git -C "$SRC" submodule update --init --recursive --quiet
+
+          cmake \
+            -S "$SRC" \
+            -B "$SRC/build" \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake \
+            --build "$SRC/build" \
+            --parallel "$(nproc)"
+
+          sudo install -m 0755 \
+            "$SRC/build/apfs-fuse" \
+            /usr/local/bin/apfs-fuse
+
+          command -v apfs-fuse
+
+      - name: Create working directories
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dsc"
+          mkdir -p "$GITHUB_WORKSPACE/frameworks"
+          mkdir -p "$GITHUB_WORKSPACE/framework-resources"
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+
+      - name: Extract arm64e dyld shared cache
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set -euo pipefail
+
+          ipsw extract \
+            --remote \
+            --device iPhone12,1 \
+            --dyld \
+            --dyld-arch arm64e \
+            --output "$GITHUB_WORKSPACE/dsc" \
+            "$IPSW_URL"
+
+          echo "=== Extracted DSC files ==="
+          find "$GITHUB_WORKSPACE/dsc" -type f -maxdepth 8 -print
+
+      - name: Locate primary dyld cache
+        id: cache
+        run: |
+          set -euo pipefail
+
+          CACHE="$(
+            find "$GITHUB_WORKSPACE/dsc" \
+              -type f \
+              -name 'dyld_shared_cache_arm64e' \
+              -print -quit
+          )"
+
+          if [ -z "$CACHE" ]; then
+            echo "Primary arm64e cache not found."
+            find "$GITHUB_WORKSPACE/dsc" -type f -print
+            exit 1
+          fi
+
+          echo "Primary cache:"
+          echo "$CACHE"
+
+          echo "cache_path=$CACHE" >> "$GITHUB_OUTPUT"
+
+      - name: Inventory target frameworks in DSC
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set -euo pipefail
+
+          ipsw dyld info "$CACHE" \
+            > "$GITHUB_WORKSPACE/evidence/DYLD_FULL_IMAGE_LIST.txt"
+
+          grep -Ei \
+            'PhotosUICore|PhotosUIPrivate|Tungsten|GridZero' \
+            "$GITHUB_WORKSPACE/evidence/DYLD_FULL_IMAGE_LIST.txt" \
+            | tee "$GITHUB_WORKSPACE/evidence/TARGET_FRAMEWORKS_IN_DSC.txt" \
+            || true
+
+      - name: Extract target framework Mach-Os
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set -euo pipefail
+
+          TARGETS=(
+            "PhotosUICore"
+            "PhotosUIPrivate"
+            "Tungsten"
+            "GridZero"
+          )
+
+          for TARGET in "${TARGETS[@]}"; do
+            echo "======================================"
+            echo "Extracting $TARGET"
+            echo "======================================"
+
+            mkdir -p "$GITHUB_WORKSPACE/frameworks/$TARGET"
+
+            if ipsw dyld extract \
+              "$CACHE" \
+              "$TARGET" \
+              --objc \
+              --stubs \
+              --force \
+              --output "$GITHUB_WORKSPACE/frameworks/$TARGET"
+            then
+              echo "$TARGET: EXTRACTED" \
+                | tee -a "$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt"
+            else
+              echo "$TARGET: NOT FOUND / EXTRACTION FAILED" \
+                | tee -a "$GITHUB_WORKSPACE/evidence/EXTRACTION_STATUS.txt"
+            fi
+          done
+
+      - name: Generate deep Mach-O evidence
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          TARGETS=(
+            "PhotosUICore"
+            "PhotosUIPrivate"
+            "Tungsten"
+            "GridZero"
+          )
+
+          for TARGET in "${TARGETS[@]}"; do
+            echo "Analyzing $TARGET"
+
+            ipsw dyld macho \
+              "$CACHE" \
+              "$TARGET" \
+              --loads \
+              --objc \
+              --objc-refs \
+              --symbols \
+              --strings \
+              > "$GITHUB_WORKSPACE/evidence/${TARGET}_FULL_ANALYSIS.txt" \
+              2>&1
+          done
+
+          exit 0
+
+      - name: Generate focused Photos behavior evidence
+        run: |
+          set -euo pipefail
+
+          : > "$GITHUB_WORKSPACE/evidence/PHOTOS_BEHAVIOR_FOCUSED.txt"
+
+          find "$GITHUB_WORKSPACE/evidence" \
+            -name '*_FULL_ANALYSIS.txt' \
+            -type f \
+            -print0 \
+          | while IFS= read -r -d '' FILE; do
+
+              echo "" \
+                >> "$GITHUB_WORKSPACE/evidence/PHOTOS_BEHAVIOR_FOCUSED.txt"
+
+              echo "===== $(basename "$FILE") =====" \
+                >> "$GITHUB_WORKSPACE/evidence/PHOTOS_BEHAVIOR_FOCUSED.txt"
+
+              grep -Ei \
+                'zoomLevel|setZoomLevel|transitionToZoomLevel|zoomIn|zoomOut|pinch|magnif|scale|focal|anchor|gesture|Grid|SectionedGrid|SelectionManager|selection|OneUp|currentAssetReference|scrubber|filmstrip|paging|pageSwipe|interactiveTransition|transitionProgress|fractional|Animator|NavigationTransition' \
+                "$FILE" \
+                >> "$GITHUB_WORKSPACE/evidence/PHOTOS_BEHAVIOR_FOCUSED.txt" \
+                || true
+            done
+
+      - name: Extract framework resource folders from filesystem
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set +e
+
+          ipsw extract \
+            --remote \
+            --device iPhone12,1 \
+            --files \
+            --pattern '.*(PhotosUICore|PhotosUIPrivate|Tungsten|GridZero)\.framework/.*' \
+            --output "$GITHUB_WORKSPACE/framework-resources" \
+            "$IPSW_URL"
+
+          exit 0
+
+      - name: Build inventory
+        run: |
+          set -euo pipefail
+
+          {
+            echo "APPLE PHOTOS PRIVATE FRAMEWORK REFERENCE"
+            echo
+            echo "Device: iPhone 11"
+            echo "Product: iPhone12,1"
+            echo "OS: iOS 27.0"
+            echo "Build: 24A437"
+            echo
+            echo "Targets:"
+            echo "- PhotosUICore"
+            echo "- PhotosUIPrivate"
+            echo "- Tungsten"
+            echo "- GridZero"
+            echo
+            echo "=== Extracted framework binaries ==="
+            find "$GITHUB_WORKSPACE/frameworks" \
+              -type f \
+              -exec ls -lh {} \;
+            echo
+            echo "=== Resource files ==="
+            find "$GITHUB_WORKSPACE/framework-resources" \
+              -type f \
+              -print
+          } > "$GITHUB_WORKSPACE/evidence/REFERENCE_INFO.txt"
+
+      - name: Package framework reference
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/package"
+
+          cp -a \
+            "$GITHUB_WORKSPACE/frameworks" \
+            "$GITHUB_WORKSPACE/package/"
+
+          cp -a \
+            "$GITHUB_WORKSPACE/framework-resources" \
+            "$GITHUB_WORKSPACE/package/"
+
+          cp -a \
+            "$GITHUB_WORKSPACE/evidence" \
+            "$GITHUB_WORKSPACE/package/"
+
+          cd "$GITHUB_WORKSPACE/package"
+
+          zip -qry \
+            "$GITHUB_WORKSPACE/Apple_Photos_PrivateFrameworks_iOS27_24A437.zip" \
+            .
+
+          cd "$GITHUB_WORKSPACE"
+
+          sha256sum \
+            Apple_Photos_PrivateFrameworks_iOS27_24A437.zip \
+            > Apple_Photos_PrivateFrameworks_iOS27_24A437.zip.sha256
+
+          echo "=== FINAL PACKAGE ==="
+          ls -lh Apple_Photos_PrivateFrameworks_iOS27_24A437.zip
+
+          echo "=== SHA-256 ==="
+          cat Apple_Photos_PrivateFrameworks_iOS27_24A437.zip.sha256
+
+      - name: Upload private framework reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_Photos_PrivateFrameworks_iOS27_24A437
+          path: |
+            Apple_Photos_PrivateFrameworks_iOS27_24A437.zip
+            Apple_Photos_PrivateFrameworks_iOS27_24A437.zip.sha256
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Final disk space
+        if: always()
+        run: df -h

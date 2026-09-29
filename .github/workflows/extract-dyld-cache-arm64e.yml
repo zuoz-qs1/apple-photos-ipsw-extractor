@@ -345,33 +345,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          cat > "$GITHUB_WORKSPACE/output/README_REASSEMBLE.txt" <<'EOF'
-Apple dyld_shared_cache arm64e
-iPhone12,1
-iOS 27.0
-Build 24A437
-
-The TAR was split into 450 MiB chunks for easier transfer.
-
-REASSEMBLE:
-
-cat Apple_DYLD_arm64e_iOS27_24A437.tar.part-* \
-  > Apple_DYLD_arm64e_iOS27_24A437.tar
-
-VERIFY COMPLETE TAR:
-
-sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
-
-VERIFY INDIVIDUAL PARTS:
-
-sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.parts.sha256
-
-EXTRACT:
-
-mkdir Apple_DYLD_arm64e_iOS27_24A437
-tar -xf Apple_DYLD_arm64e_iOS27_24A437.tar \
-  -C Apple_DYLD_arm64e_iOS27_24A437
-EOF
+          {
+            echo "Apple dyld_shared_cache arm64e"
+            echo "iPhone12,1"
+            echo "iOS 27.0"
+            echo "Build 24A437"
+            echo
+            echo "The TAR was split into 450 MiB chunks for easier transfer."
+            echo
+            echo "REASSEMBLE:"
+            echo
+            echo "cat Apple_DYLD_arm64e_iOS27_24A437.tar.part-* \\"
+            echo "  > Apple_DYLD_arm64e_iOS27_24A437.tar"
+            echo
+            echo "VERIFY COMPLETE TAR:"
+            echo
+            echo "sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.tar.sha256"
+            echo
+            echo "VERIFY INDIVIDUAL PARTS:"
+            echo
+            echo "sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.parts.sha256"
+            echo
+            echo "EXTRACT:"
+            echo
+            echo "mkdir Apple_DYLD_arm64e_iOS27_24A437"
+            echo "tar -xf Apple_DYLD_arm64e_iOS27_24A437.tar \\"
+            echo "  -C Apple_DYLD_arm64e_iOS27_24A437"
+          } > "$GITHUB_WORKSPACE/output/README_REASSEMBLE.txt"
 
           cat \
             "$GITHUB_WORKSPACE/output/README_REASSEMBLE.txt"

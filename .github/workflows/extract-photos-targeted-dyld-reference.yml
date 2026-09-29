@@ -166,21 +166,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          cat > "$GITHUB_WORKSPACE/reference/TARGET_IMAGES.txt" <<'EOF'
-          /System/Library/PrivateFrameworks/PhotosUICore.framework/PhotosUICore
-          /System/Library/PrivateFrameworks/PhotosUIPrivate.framework/PhotosUIPrivate
-          /System/Library/PrivateFrameworks/Tungsten.framework/Tungsten
-          /System/Library/PrivateFrameworks/GridZero.framework/GridZero
-          /System/Library/PrivateFrameworks/PhotosUIFoundation.framework/PhotosUIFoundation
-          /System/Library/PrivateFrameworks/PhotosSwiftUICore.framework/PhotosSwiftUICore
-          /System/Library/PrivateFrameworks/PhotosUIComponents.framework/PhotosUIComponents
-          EOF
+          printf '%s\n' \
+            '/System/Library/PrivateFrameworks/PhotosUICore.framework/PhotosUICore' \
+            '/System/Library/PrivateFrameworks/PhotosUIPrivate.framework/PhotosUIPrivate' \
+            '/System/Library/PrivateFrameworks/Tungsten.framework/Tungsten' \
+            '/System/Library/PrivateFrameworks/GridZero.framework/GridZero' \
+            '/System/Library/PrivateFrameworks/PhotosUIFoundation.framework/PhotosUIFoundation' \
+            '/System/Library/PrivateFrameworks/PhotosSwiftUICore.framework/PhotosSwiftUICore' \
+            '/System/Library/PrivateFrameworks/PhotosUIComponents.framework/PhotosUIComponents' \
+            > "$GITHUB_WORKSPACE/reference/TARGET_IMAGES.txt"
 
-          sed -i 's/^          //' \
-            "$GITHUB_WORKSPACE/reference/TARGET_IMAGES.txt"
-
-          cat \
-            "$GITHUB_WORKSPACE/reference/TARGET_IMAGES.txt"
+          cat "$GITHUB_WORKSPACE/reference/TARGET_IMAGES.txt"
 
       - name: Extract seven target Mach-O binaries
         env:
@@ -254,8 +250,7 @@ jobs:
 
           } > "$GITHUB_WORKSPACE/reference/BINARY_VERIFICATION.txt"
 
-          cat \
-            "$GITHUB_WORKSPACE/reference/BINARY_VERIFICATION.txt"
+          cat "$GITHUB_WORKSPACE/reference/BINARY_VERIFICATION.txt"
 
       - name: Generate deep Mach-O analysis
         env:
@@ -672,7 +667,7 @@ jobs:
             -type f \
             -printf '%s %p\n' \
             | sort -nr \
-            | head -30 \
+            | sed -n '1,30p' \
             | numfmt \
                 --field=1 \
                 --to=iec
@@ -705,27 +700,23 @@ jobs:
           cat \
             Apple_Photos_Targeted_DYLD_Reference_iOS27_24A437.zip.sha256
 
-      - name: Enforce upload-friendly package size
+      - name: Check upload-friendly package size
         run: |
           set -euo pipefail
 
           FILE="$GITHUB_WORKSPACE/Apple_Photos_Targeted_DYLD_Reference_iOS27_24A437.zip"
 
-          SIZE="$(
-            stat -c '%s' "$FILE"
-          )"
+          SIZE="$(stat -c '%s' "$FILE")"
+          LIMIT=$((480 * 1024 * 1024))
 
           echo "Final size in bytes: $SIZE"
-
-          LIMIT=$((480 * 1024 * 1024))
 
           if [ "$SIZE" -gt "$LIMIT" ]; then
 
             echo
             echo "WARNING:"
             echo "Targeted bundle exceeds 480 MiB."
-            echo "It will still be uploaded to GitHub Actions,"
-            echo "but may be inconvenient for ChatGPT upload."
+            echo "It will still be uploaded to GitHub Actions."
 
           else
 

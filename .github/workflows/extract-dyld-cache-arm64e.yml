@@ -1,4 +1,4 @@
-name: Extract Full arm64e Dyld Cache
+name: Extract Full arm64e Dyld Cache - Split Artifacts
 
 on:
   workflow_dispatch:
@@ -12,19 +12,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: full-arm64e-dyld-cache
+  group: full-arm64e-dyld-cache-split
   cancel-in-progress: true
 
 jobs:
   extract:
-    name: Extract Full arm64e Dyld Shared Cache
+    name: Extract and Split arm64e Dyld Cache
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     steps:
       - name: Show disk space
-        run: |
-          df -h
+        run: df -h
 
       - name: Install latest ipsw
         env:
@@ -203,14 +202,14 @@ jobs:
 
           ls -lah "$GITHUB_WORKSPACE/cache-package"
 
-      - name: Verify primary cache exists in package
+      - name: Verify primary cache
         run: |
           set -euo pipefail
 
           PRIMARY="$GITHUB_WORKSPACE/cache-package/dyld_shared_cache_arm64e"
 
           if [ ! -f "$PRIMARY" ]; then
-            echo "ERROR: primary cache missing from package."
+            echo "ERROR: primary cache missing."
             exit 1
           fi
 
@@ -223,7 +222,7 @@ jobs:
 
           du -h "$PRIMARY"
 
-      - name: Generate SHA-256 manifest for raw cache files
+      - name: Generate raw cache SHA-256 manifest
         run: |
           set -euo pipefail
 
@@ -261,71 +260,54 @@ jobs:
             echo "Purpose:"
             echo "Cross-framework analysis for Apple Photos architecture."
             echo
-            echo "Expected contents:"
-            echo "- dyld_shared_cache_arm64e"
-            echo "- all matching arm64e subcaches"
-            echo "- symbols cache if present"
-            echo
-            echo "=== FILE INVENTORY ==="
+            echo "=== CACHE FILES ==="
 
             find "$GITHUB_WORKSPACE/cache-package" \
               -maxdepth 1 \
               -type f \
+              -name 'dyld_shared_cache_arm64e*' \
               -exec ls -lh {} \;
 
           } > "$INFO"
 
           cat "$INFO"
 
-      - name: Create uncompressed TAR
+      - name: Stream TAR directly into 400 MiB parts
+        shell: bash
         run: |
           set -euo pipefail
 
           cd "$GITHUB_WORKSPACE/cache-package"
 
-          tar -cf \
-            "$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar" \
-            .
+          TAR_SHA="$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar.sha256"
 
-          echo
-          echo "=== TAR SIZE ==="
+          PREFIX="$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-"
 
-          ls -lh \
-            "$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar"
-
-      - name: Generate whole TAR SHA-256
-        run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/output"
-
-          sha256sum \
-            Apple_DYLD_arm64e_iOS27_24A437.tar \
-            > Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
-
-          cat \
-            Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
-
-      - name: Split TAR into 450 MiB parts
-        run: |
-          set -euo pipefail
-
-          cd "$GITHUB_WORKSPACE/output"
-
-          split \
-            -b 450M \
-            -d \
-            -a 3 \
-            Apple_DYLD_arm64e_iOS27_24A437.tar \
-            Apple_DYLD_arm64e_iOS27_24A437.tar.part-
+          tar -cf - . \
+            | tee >(
+                sha256sum \
+                | awk '{print $1 "  Apple_DYLD_arm64e_iOS27_24A437.tar"}' \
+                > "$TAR_SHA"
+              ) \
+            | split \
+                -b 400M \
+                -d \
+                -a 3 \
+                - \
+                "$PREFIX"
 
           echo
           echo "=== SPLIT PARTS ==="
 
           ls -lh \
-            Apple_DYLD_arm64e_iOS27_24A437.tar.part-*
+            "$GITHUB_WORKSPACE/output"/Apple_DYLD_arm64e_iOS27_24A437.tar.part-*
 
-      - name: Generate split-parts SHA-256
+          echo
+          echo "=== COMPLETE TAR SHA-256 ==="
+
+          cat "$TAR_SHA"
+
+      - name: Generate part SHA-256 manifest
         run: |
           set -euo pipefail
 
@@ -341,6 +323,18 @@ jobs:
           cat \
             Apple_DYLD_arm64e_iOS27_24A437.parts.sha256
 
+      - name: Copy metadata
+        run: |
+          set -euo pipefail
+
+          cp \
+            "$GITHUB_WORKSPACE/cache-package/DYLD_CACHE_RAW_SHA256.txt" \
+            "$GITHUB_WORKSPACE/output/"
+
+          cp \
+            "$GITHUB_WORKSPACE/cache-package/REFERENCE_INFO.txt" \
+            "$GITHUB_WORKSPACE/output/"
+
       - name: Create reconstruction instructions
         run: |
           set -euo pipefail
@@ -351,47 +345,41 @@ jobs:
             echo "iOS 27.0"
             echo "Build 24A437"
             echo
-            echo "The TAR was split into 450 MiB chunks for easier transfer."
+            echo "The cache has been split into 400 MiB transfer parts."
+            echo
+            echo "Download every PART artifact plus the METADATA artifact."
+            echo
+            echo "Extract every GitHub artifact ZIP."
+            echo "Place all raw part files and metadata files in one directory."
+            echo
+            echo "VERIFY PARTS:"
+            echo
+            echo "sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.parts.sha256"
             echo
             echo "REASSEMBLE:"
             echo
-            echo "cat Apple_DYLD_arm64e_iOS27_24A437.tar.part-* \\"
-            echo "  > Apple_DYLD_arm64e_iOS27_24A437.tar"
+            echo "cat Apple_DYLD_arm64e_iOS27_24A437.tar.part-* > Apple_DYLD_arm64e_iOS27_24A437.tar"
             echo
             echo "VERIFY COMPLETE TAR:"
             echo
             echo "sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.tar.sha256"
             echo
-            echo "VERIFY INDIVIDUAL PARTS:"
-            echo
-            echo "sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.parts.sha256"
-            echo
             echo "EXTRACT:"
             echo
             echo "mkdir Apple_DYLD_arm64e_iOS27_24A437"
-            echo "tar -xf Apple_DYLD_arm64e_iOS27_24A437.tar \\"
-            echo "  -C Apple_DYLD_arm64e_iOS27_24A437"
+            echo
+            echo "tar -xf Apple_DYLD_arm64e_iOS27_24A437.tar -C Apple_DYLD_arm64e_iOS27_24A437"
           } > "$GITHUB_WORKSPACE/output/README_REASSEMBLE.txt"
 
           cat \
             "$GITHUB_WORKSPACE/output/README_REASSEMBLE.txt"
 
-      - name: Remove full TAR before artifact upload
-        run: |
-          set -euo pipefail
-
-          rm \
-            "$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar"
-
-          echo "Full TAR removed from upload set."
-          echo "Only split parts + hashes + instructions remain."
-
-      - name: Show final upload package
+      - name: Show final output
         run: |
           set -euo pipefail
 
           echo
-          echo "=== FINAL UPLOAD CONTENTS ==="
+          echo "=== FINAL OUTPUT ==="
 
           ls -lah "$GITHUB_WORKSPACE/output"
 
@@ -400,20 +388,200 @@ jobs:
 
           du -sh "$GITHUB_WORKSPACE/output"
 
-      - name: Upload complete dyld cache reference
+      - name: Upload metadata
         uses: actions/upload-artifact@v4
         with:
-          name: Apple_DYLD_arm64e_iOS27_24A437
+          name: Apple_DYLD_arm64e_iOS27_24A437_METADATA
           path: |
-            output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-*
             output/Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
             output/Apple_DYLD_arm64e_iOS27_24A437.parts.sha256
+            output/DYLD_CACHE_RAW_SHA256.txt
+            output/REFERENCE_INFO.txt
             output/README_REASSEMBLE.txt
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
 
+      - name: Upload part 000
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-000') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_000
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-000
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 001
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-001') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_001
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-001
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 002
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-002') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_002
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-002
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 003
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-003') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_003
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-003
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 004
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-004') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_004
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-004
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 005
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-005') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_005
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-005
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 006
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-006') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_006
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-006
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 007
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-007') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_007
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-007
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 008
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-008') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_008
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-008
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 009
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-009') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_009
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-009
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 010
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-010') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_010
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-010
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 011
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-011') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_011
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-011
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 012
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-012') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_012
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-012
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 013
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-013') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_013
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-013
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 014
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-014') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_014
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-014
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 015
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-015') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_015
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-015
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 016
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-016') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_016
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-016
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 017
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-017') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_017
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-017
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 018
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-018') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_018
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-018
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload part 019
+        if: ${{ hashFiles('output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-019') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437_PART_019
+          path: output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-019
+          retention-days: 3
+          compression-level: 0
+
       - name: Final disk space
         if: always()
-        run: |
-          df -h
+        run: df -h

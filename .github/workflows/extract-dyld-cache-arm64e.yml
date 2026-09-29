@@ -1,0 +1,419 @@
+name: Extract Full arm64e Dyld Cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "Direct Apple IPSW URL"
+        required: true
+        default: "https://updates.cdn-apple.com/2026FallFCS/d47bac10-cddf-4f79-a014-411e2fea1fdb/iPhone12%2C1_27.0_24A437_Restore.ipsw"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-arm64e-dyld-cache
+  cancel-in-progress: true
+
+jobs:
+  extract:
+    name: Extract Full arm64e Dyld Shared Cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Show disk space
+        run: |
+          df -h
+
+      - name: Install latest ipsw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/blacktop/ipsw/releases/latest \
+            | jq -r '.tag_name' \
+            | sed 's/^v//'
+          )"
+
+          echo "Installing ipsw ${VERSION}"
+
+          curl -fL \
+            "https://github.com/blacktop/ipsw/releases/latest/download/ipsw_${VERSION}_linux_x86_64.tar.gz" \
+            -o /tmp/ipsw.tar.gz
+
+          tar -xzf /tmp/ipsw.tar.gz -C /tmp
+
+          sudo install -m 0755 \
+            /tmp/ipsw \
+            /usr/local/bin/ipsw
+
+          ipsw version
+
+      - name: Install APFS support
+        env:
+          APFS_FUSE_SHA: 66b86bd525e8cb90f9012543be89b1f092b75cf3
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 \
+            libfuse3-dev \
+            libbz2-dev \
+            libattr1-dev \
+            zlib1g-dev \
+            cmake \
+            g++ \
+            git
+
+          SRC="$RUNNER_TEMP/apfs-fuse"
+
+          git clone --quiet \
+            https://github.com/sgan81/apfs-fuse.git \
+            "$SRC"
+
+          git -C "$SRC" checkout --quiet "$APFS_FUSE_SHA"
+
+          git -C "$SRC" \
+            submodule update \
+            --init \
+            --recursive \
+            --quiet
+
+          cmake \
+            -S "$SRC" \
+            -B "$SRC/build" \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake \
+            --build "$SRC/build" \
+            --parallel "$(nproc)"
+
+          sudo install -m 0755 \
+            "$SRC/build/apfs-fuse" \
+            /usr/local/bin/apfs-fuse
+
+          command -v apfs-fuse
+
+      - name: Create working directories
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/dsc"
+          mkdir -p "$GITHUB_WORKSPACE/cache-package"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+      - name: Extract complete arm64e dyld shared cache
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set -euo pipefail
+
+          ipsw extract \
+            --remote \
+            --device iPhone12,1 \
+            --dyld \
+            --dyld-arch arm64e \
+            --output "$GITHUB_WORKSPACE/dsc" \
+            "$IPSW_URL"
+
+          echo
+          echo "=== ALL EXTRACTED FILES ==="
+
+          find "$GITHUB_WORKSPACE/dsc" \
+            -type f \
+            -exec ls -lh {} \;
+
+      - name: Locate complete arm64e cache family
+        id: locate
+        run: |
+          set -euo pipefail
+
+          PRIMARY="$(
+            find "$GITHUB_WORKSPACE/dsc" \
+              -type f \
+              -name 'dyld_shared_cache_arm64e' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$PRIMARY" ]; then
+            echo "ERROR: dyld_shared_cache_arm64e primary file not found."
+            find "$GITHUB_WORKSPACE/dsc" -type f -print
+            exit 1
+          fi
+
+          CACHE_DIR="$(dirname "$PRIMARY")"
+
+          echo "Primary cache:"
+          echo "$PRIMARY"
+
+          echo
+          echo "Cache directory:"
+          echo "$CACHE_DIR"
+
+          echo "cache_dir=$CACHE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Copy primary cache and all subcaches
+        env:
+          CACHE_DIR: ${{ steps.locate.outputs.cache_dir }}
+        run: |
+          set -euo pipefail
+
+          FOUND=0
+
+          while IFS= read -r -d '' FILE; do
+
+            NAME="$(basename "$FILE")"
+
+            echo "Copying:"
+            echo "$NAME"
+
+            cp -a \
+              "$FILE" \
+              "$GITHUB_WORKSPACE/cache-package/$NAME"
+
+            FOUND=$((FOUND + 1))
+
+          done < <(
+            find "$CACHE_DIR" \
+              -maxdepth 1 \
+              -type f \
+              -name 'dyld_shared_cache_arm64e*' \
+              -print0
+          )
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "ERROR: No arm64e cache files copied."
+            exit 1
+          fi
+
+          echo
+          echo "Copied $FOUND cache-family files."
+
+          echo
+          echo "=== CACHE PACKAGE CONTENTS ==="
+
+          ls -lah "$GITHUB_WORKSPACE/cache-package"
+
+      - name: Verify primary cache exists in package
+        run: |
+          set -euo pipefail
+
+          PRIMARY="$GITHUB_WORKSPACE/cache-package/dyld_shared_cache_arm64e"
+
+          if [ ! -f "$PRIMARY" ]; then
+            echo "ERROR: primary cache missing from package."
+            exit 1
+          fi
+
+          echo "Primary cache present."
+
+          file "$PRIMARY"
+
+          echo
+          echo "Primary size:"
+
+          du -h "$PRIMARY"
+
+      - name: Generate SHA-256 manifest for raw cache files
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/cache-package"
+
+          find . \
+            -maxdepth 1 \
+            -type f \
+            -name 'dyld_shared_cache_arm64e*' \
+            -print0 \
+          | sort -z \
+          | xargs -0 sha256sum \
+            > DYLD_CACHE_RAW_SHA256.txt
+
+          echo
+          echo "=== RAW CACHE SHA-256 ==="
+
+          cat DYLD_CACHE_RAW_SHA256.txt
+
+      - name: Build cache inventory
+        run: |
+          set -euo pipefail
+
+          INFO="$GITHUB_WORKSPACE/cache-package/REFERENCE_INFO.txt"
+
+          {
+            echo "APPLE DYLD SHARED CACHE REFERENCE"
+            echo
+            echo "Device: iPhone 11"
+            echo "Product: iPhone12,1"
+            echo "OS: iOS 27.0"
+            echo "Build: 24A437"
+            echo "Architecture: arm64e"
+            echo
+            echo "Purpose:"
+            echo "Cross-framework analysis for Apple Photos architecture."
+            echo
+            echo "Expected contents:"
+            echo "- dyld_shared_cache_arm64e"
+            echo "- all matching arm64e subcaches"
+            echo "- symbols cache if present"
+            echo
+            echo "=== FILE INVENTORY ==="
+
+            find "$GITHUB_WORKSPACE/cache-package" \
+              -maxdepth 1 \
+              -type f \
+              -exec ls -lh {} \;
+
+          } > "$INFO"
+
+          cat "$INFO"
+
+      - name: Create uncompressed TAR
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/cache-package"
+
+          tar -cf \
+            "$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar" \
+            .
+
+          echo
+          echo "=== TAR SIZE ==="
+
+          ls -lh \
+            "$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar"
+
+      - name: Generate whole TAR SHA-256
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/output"
+
+          sha256sum \
+            Apple_DYLD_arm64e_iOS27_24A437.tar \
+            > Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
+
+          cat \
+            Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
+
+      - name: Split TAR into 450 MiB parts
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/output"
+
+          split \
+            -b 450M \
+            -d \
+            -a 3 \
+            Apple_DYLD_arm64e_iOS27_24A437.tar \
+            Apple_DYLD_arm64e_iOS27_24A437.tar.part-
+
+          echo
+          echo "=== SPLIT PARTS ==="
+
+          ls -lh \
+            Apple_DYLD_arm64e_iOS27_24A437.tar.part-*
+
+      - name: Generate split-parts SHA-256
+        run: |
+          set -euo pipefail
+
+          cd "$GITHUB_WORKSPACE/output"
+
+          sha256sum \
+            Apple_DYLD_arm64e_iOS27_24A437.tar.part-* \
+            > Apple_DYLD_arm64e_iOS27_24A437.parts.sha256
+
+          echo
+          echo "=== PART SHA-256 ==="
+
+          cat \
+            Apple_DYLD_arm64e_iOS27_24A437.parts.sha256
+
+      - name: Create reconstruction instructions
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/output/README_REASSEMBLE.txt" <<'EOF'
+Apple dyld_shared_cache arm64e
+iPhone12,1
+iOS 27.0
+Build 24A437
+
+The TAR was split into 450 MiB chunks for easier transfer.
+
+REASSEMBLE:
+
+cat Apple_DYLD_arm64e_iOS27_24A437.tar.part-* \
+  > Apple_DYLD_arm64e_iOS27_24A437.tar
+
+VERIFY COMPLETE TAR:
+
+sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
+
+VERIFY INDIVIDUAL PARTS:
+
+sha256sum -c Apple_DYLD_arm64e_iOS27_24A437.parts.sha256
+
+EXTRACT:
+
+mkdir Apple_DYLD_arm64e_iOS27_24A437
+tar -xf Apple_DYLD_arm64e_iOS27_24A437.tar \
+  -C Apple_DYLD_arm64e_iOS27_24A437
+EOF
+
+          cat \
+            "$GITHUB_WORKSPACE/output/README_REASSEMBLE.txt"
+
+      - name: Remove full TAR before artifact upload
+        run: |
+          set -euo pipefail
+
+          rm \
+            "$GITHUB_WORKSPACE/output/Apple_DYLD_arm64e_iOS27_24A437.tar"
+
+          echo "Full TAR removed from upload set."
+          echo "Only split parts + hashes + instructions remain."
+
+      - name: Show final upload package
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "=== FINAL UPLOAD CONTENTS ==="
+
+          ls -lah "$GITHUB_WORKSPACE/output"
+
+          echo
+          echo "=== TOTAL SIZE ==="
+
+          du -sh "$GITHUB_WORKSPACE/output"
+
+      - name: Upload complete dyld cache reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_DYLD_arm64e_iOS27_24A437
+          path: |
+            output/Apple_DYLD_arm64e_iOS27_24A437.tar.part-*
+            output/Apple_DYLD_arm64e_iOS27_24A437.tar.sha256
+            output/Apple_DYLD_arm64e_iOS27_24A437.parts.sha256
+            output/README_REASSEMBLE.txt
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Final disk space
+        if: always()
+        run: |
+          df -h

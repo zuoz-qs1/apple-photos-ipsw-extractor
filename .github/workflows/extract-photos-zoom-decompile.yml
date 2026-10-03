@@ -1,0 +1,1190 @@
+name: Extract Photos Zoom Stack - Decompile Reference
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "Direct Apple IPSW URL"
+        required: true
+        default: "https://updates.cdn-apple.com/2026FallFCS/d47bac10-cddf-4f79-a014-411e2fea1fdb/iPhone12%2C1_27.0_24A437_Restore.ipsw"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: photos-zoom-decompile-reference
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Extract and Decompile Photos Zoom Stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Show disk space
+        run: |
+          df -h
+
+      - name: Install latest ipsw
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/blacktop/ipsw/releases/latest \
+            | jq -r '.tag_name' \
+            | sed 's/^v//'
+          )"
+
+          echo "Installing ipsw ${VERSION}"
+
+          curl -fL \
+            "https://github.com/blacktop/ipsw/releases/latest/download/ipsw_${VERSION}_linux_x86_64.tar.gz" \
+            -o /tmp/ipsw.tar.gz
+
+          tar -xzf /tmp/ipsw.tar.gz -C /tmp
+
+          sudo install -m 0755 \
+            /tmp/ipsw \
+            /usr/local/bin/ipsw
+
+          ipsw version
+
+      - name: Install extraction and decompiler dependencies
+        env:
+          APFS_FUSE_SHA: 66b86bd525e8cb90f9012543be89b1f092b75cf3
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 \
+            libfuse3-dev \
+            libbz2-dev \
+            libattr1-dev \
+            zlib1g-dev \
+            cmake \
+            g++ \
+            git \
+            jq \
+            zip \
+            unzip \
+            openjdk-21-jdk-headless
+
+          SRC="$RUNNER_TEMP/apfs-fuse"
+
+          git clone --quiet \
+            https://github.com/sgan81/apfs-fuse.git \
+            "$SRC"
+
+          git -C "$SRC" checkout --quiet "$APFS_FUSE_SHA"
+
+          git -C "$SRC" \
+            submodule update \
+            --init \
+            --recursive \
+            --quiet
+
+          cmake \
+            -S "$SRC" \
+            -B "$SRC/build" \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake \
+            --build "$SRC/build" \
+            --parallel "$(nproc)"
+
+          sudo install -m 0755 \
+            "$SRC/build/apfs-fuse" \
+            /usr/local/bin/apfs-fuse
+
+          command -v apfs-fuse
+          java -version
+
+      - name: Create working directories
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/dsc"
+
+          mkdir -p "$GITHUB_WORKSPACE/reference/search"
+          mkdir -p "$GITHUB_WORKSPACE/reference/manifests"
+
+          mkdir -p "$GITHUB_WORKSPACE/reference/binaries/core"
+          mkdir -p "$GITHUB_WORKSPACE/reference/binaries/discovered"
+
+          mkdir -p "$GITHUB_WORKSPACE/reference/analysis"
+          mkdir -p "$GITHUB_WORKSPACE/reference/disassembly"
+
+          mkdir -p "$GITHUB_WORKSPACE/reference/headers"
+          mkdir -p "$GITHUB_WORKSPACE/reference/swift"
+
+          mkdir -p "$GITHUB_WORKSPACE/reference/decompiled"
+          mkdir -p "$GITHUB_WORKSPACE/reference/dependencies"
+
+          mkdir -p "$GITHUB_WORKSPACE/ghidra-scripts"
+          mkdir -p "$GITHUB_WORKSPACE/ghidra-projects"
+
+      - name: Extract arm64e dyld shared cache
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set -euo pipefail
+
+          ipsw extract \
+            --remote \
+            --device iPhone12,1 \
+            --dyld \
+            --dyld-arch arm64e \
+            --output "$GITHUB_WORKSPACE/dsc" \
+            "$IPSW_URL"
+
+          echo
+          echo "=== DYLD FILES ==="
+
+          find "$GITHUB_WORKSPACE/dsc" \
+            -type f \
+            -exec ls -lh {} \;
+
+      - name: Locate primary dyld cache
+        id: cache
+        run: |
+          set -euo pipefail
+
+          CACHE="$(
+            find "$GITHUB_WORKSPACE/dsc" \
+              -type f \
+              -name 'dyld_shared_cache_arm64e' \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$CACHE" ]; then
+            echo "ERROR: dyld_shared_cache_arm64e not found."
+            exit 1
+          fi
+
+          echo
+          echo "Primary cache:"
+          echo "$CACHE"
+
+          echo "cache_path=$CACHE" >> "$GITHUB_OUTPUT"
+
+      - name: Save core Photos images
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt" <<'EOF'
+          /System/Library/PrivateFrameworks/PhotosUICore.framework/PhotosUICore
+          /System/Library/PrivateFrameworks/PhotosUIPrivate.framework/PhotosUIPrivate
+          /System/Library/PrivateFrameworks/GridZero.framework/GridZero
+          /System/Library/PrivateFrameworks/Tungsten.framework/Tungsten
+          /System/Library/PrivateFrameworks/PhotosUIFoundation.framework/PhotosUIFoundation
+          /System/Library/PrivateFrameworks/PhotosSwiftUICore.framework/PhotosSwiftUICore
+          /System/Library/PrivateFrameworks/PhotosUIComponents.framework/PhotosUIComponents
+          EOF
+
+          sed -i \
+            's/^          //' \
+            "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt"
+
+          cat \
+            "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt"
+
+      - name: Search global Zoom class owners
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          OUT="$GITHUB_WORKSPACE/reference/search/GLOBAL_ZOOM_CLASS_OWNERS.txt"
+
+          ipsw dyld search objc \
+            "$CACHE" \
+            --class 'PXZoomablePhotos|PXGZoomLayout|PXAlphaLayer|ZoomablePhotos|ZoomLayout|Zoom.*Animator' \
+            > "$OUT" \
+            2>&1
+
+          STATUS=$?
+
+          echo >> "$OUT"
+          echo "SEARCH_EXIT_STATUS=$STATUS" >> "$OUT"
+
+          cat "$OUT"
+
+          exit 0
+
+      - name: Search rare Zoom selectors globally
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          OUT="$GITHUB_WORKSPACE/reference/search/GLOBAL_RARE_SELECTOR_IMPLEMENTATIONS.txt"
+
+          ipsw dyld search objc \
+            "$CACHE" \
+            --sel 'fromColumnIndex|toColumnIndex|interactiveProgress|interactiveZoom|columnWidth|matchMove|prefetch|zoomAnchor|anchorPoint|settle' \
+            > "$OUT" \
+            2>&1
+
+          STATUS=$?
+
+          echo >> "$OUT"
+          echo "SEARCH_EXIT_STATUS=$STATUS" >> "$OUT"
+
+          cat "$OUT"
+
+          exit 0
+
+      - name: Search Zoom selectors inside core Photos images
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          OUT="$GITHUB_WORKSPACE/reference/search/CORE_ZOOM_SELECTOR_IMPLEMENTATIONS.txt"
+
+          : > "$OUT"
+
+          while IFS= read -r IMAGE; do
+
+            [ -n "$IMAGE" ] || continue
+
+            echo >> "$OUT"
+            echo "==================================================" >> "$OUT"
+            echo "IMAGE: $IMAGE" >> "$OUT"
+            echo "==================================================" >> "$OUT"
+
+            ipsw dyld search objc \
+              "$CACHE" \
+              --image "$IMAGE" \
+              --sel 'pinch|zoom|interactive|column|anchor|layout|settle|animat|matchMove|prefetch|progress|density' \
+              >> "$OUT" \
+              2>&1
+
+          done < "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt"
+
+          cat "$OUT"
+
+          exit 0
+
+      - name: Discover owner image basenames
+        run: |
+          set -euo pipefail
+
+          cat \
+            "$GITHUB_WORKSPACE/reference/search/GLOBAL_ZOOM_CLASS_OWNERS.txt" \
+            "$GITHUB_WORKSPACE/reference/search/GLOBAL_RARE_SELECTOR_IMPLEMENTATIONS.txt" \
+            "$GITHUB_WORKSPACE/reference/search/CORE_ZOOM_SELECTOR_IMPLEMENTATIONS.txt" \
+          | sed -E $'s/\x1B\[[0-9;]*[mK]//g' \
+          | sed -nE \
+              's/^0x[0-9a-fA-F]+:[[:space:]]*([^[:space:]]+).*/\1/p' \
+          | sort -u \
+          > "$GITHUB_WORKSPACE/reference/manifests/DISCOVERED_OWNER_BASENAMES.txt" \
+          || true
+
+          echo
+          echo "=== DISCOVERED OWNER BASENAMES ==="
+
+          cat \
+            "$GITHUB_WORKSPACE/reference/manifests/DISCOVERED_OWNER_BASENAMES.txt" \
+            || true
+
+      - name: Build target selector IMP address list
+        run: |
+          set -euo pipefail
+
+          cat \
+            "$GITHUB_WORKSPACE/reference/search/GLOBAL_RARE_SELECTOR_IMPLEMENTATIONS.txt" \
+            "$GITHUB_WORKSPACE/reference/search/CORE_ZOOM_SELECTOR_IMPLEMENTATIONS.txt" \
+          | sed -E $'s/\x1B\[[0-9;]*[mK]//g' \
+          | grep -Eo '^0x[0-9a-fA-F]+' \
+          | sort -u \
+          > "$GITHUB_WORKSPACE/reference/manifests/TARGET_IMP_ADDRESSES.txt" \
+          || true
+
+          echo
+          echo "=== TARGET IMP ADDRESSES ==="
+
+          wc -l \
+            "$GITHUB_WORKSPACE/reference/manifests/TARGET_IMP_ADDRESSES.txt"
+
+          cat \
+            "$GITHUB_WORKSPACE/reference/manifests/TARGET_IMP_ADDRESSES.txt"
+
+      - name: Disassemble target method bodies directly from dyld cache
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          INDEX=0
+
+          while IFS= read -r ADDR; do
+
+            [ -n "$ADDR" ] || continue
+
+            INDEX=$((INDEX + 1))
+
+            if [ "$INDEX" -gt 250 ]; then
+              echo "Safety cap reached at 250 methods."
+              break
+            fi
+
+            FILE="$GITHUB_WORKSPACE/reference/disassembly/$(printf '%03d' "$INDEX")_${ADDR}.txt"
+
+            echo
+            echo "Disassembling implementation at $ADDR"
+
+            timeout 90s \
+              ipsw dyld disass \
+                "$CACHE" \
+                --vaddr "$ADDR" \
+                --count 600 \
+                --demangle \
+                --force \
+                > "$FILE" \
+                2>&1
+
+          done < "$GITHUB_WORKSPACE/reference/manifests/TARGET_IMP_ADDRESSES.txt"
+
+          exit 0
+
+      - name: Extract seven core Photos binaries
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set -euo pipefail
+
+          STATUS="$GITHUB_WORKSPACE/reference/manifests/CORE_EXTRACTION_STATUS.txt"
+
+          : > "$STATUS"
+
+          while IFS= read -r IMAGE; do
+
+            [ -n "$IMAGE" ] || continue
+
+            NAME="$(basename "$IMAGE")"
+
+            DEST="$GITHUB_WORKSPACE/reference/binaries/core/$NAME"
+
+            mkdir -p "$DEST"
+
+            echo
+            echo "Extracting core image:"
+            echo "$IMAGE"
+
+            if ipsw dyld extract \
+              "$CACHE" \
+              "$IMAGE" \
+              --objc \
+              --stubs \
+              --force \
+              --output "$DEST"
+            then
+
+              echo "$NAME: EXTRACTED" \
+                | tee -a "$STATUS"
+
+            else
+
+              echo "$NAME: FAILED" \
+                | tee -a "$STATUS"
+
+            fi
+
+          done < "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt"
+
+          echo
+          cat "$STATUS"
+
+      - name: Extract additionally discovered owner images
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          STATUS="$GITHUB_WORKSPACE/reference/manifests/DISCOVERED_EXTRACTION_STATUS.txt"
+
+          : > "$STATUS"
+
+          while IFS= read -r NAME; do
+
+            [ -n "$NAME" ] || continue
+
+            case "$NAME" in
+              PhotosUICore|PhotosUIPrivate|GridZero|Tungsten|PhotosUIFoundation|PhotosSwiftUICore|PhotosUIComponents)
+                echo "$NAME: already extracted as core" \
+                  >> "$STATUS"
+                continue
+                ;;
+            esac
+
+            DEST="$GITHUB_WORKSPACE/reference/binaries/discovered/$NAME"
+
+            mkdir -p "$DEST"
+
+            echo
+            echo "Best-effort extract discovered owner:"
+            echo "$NAME"
+
+            if ipsw dyld extract \
+              "$CACHE" \
+              "$NAME" \
+              --objc \
+              --stubs \
+              --force \
+              --output "$DEST"
+            then
+
+              echo "$NAME: EXTRACTED" \
+                >> "$STATUS"
+
+            else
+
+              echo "$NAME: FAILED_OR_AMBIGUOUS" \
+                >> "$STATUS"
+
+            fi
+
+          done < "$GITHUB_WORKSPACE/reference/manifests/DISCOVERED_OWNER_BASENAMES.txt"
+
+          cat "$STATUS"
+
+          exit 0
+
+      - name: Generate deep Mach-O analysis for core stack
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          while IFS= read -r IMAGE; do
+
+            [ -n "$IMAGE" ] || continue
+
+            NAME="$(basename "$IMAGE")"
+
+            echo
+            echo "Analyzing $NAME"
+
+            ipsw dyld macho \
+              "$CACHE" \
+              "$IMAGE" \
+              --loads \
+              --objc \
+              --objc-refs \
+              --symbols \
+              --strings \
+              --starts \
+              --stubs \
+              --swift \
+              --swift-all \
+              > "$GITHUB_WORKSPACE/reference/analysis/${NAME}_FULL_ANALYSIS.txt" \
+              2>&1
+
+          done < "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt"
+
+          exit 0
+
+      - name: Generate Objective-C headers
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          while IFS= read -r IMAGE; do
+
+            [ -n "$IMAGE" ] || continue
+
+            NAME="$(basename "$IMAGE")"
+
+            DEST="$GITHUB_WORKSPACE/reference/headers/$NAME"
+
+            mkdir -p "$DEST"
+
+            ipsw class-dump \
+              "$CACHE" \
+              "$IMAGE" \
+              --headers \
+              -o "$DEST" \
+              > "$GITHUB_WORKSPACE/reference/headers/${NAME}_LOG.txt" \
+              2>&1
+
+          done < "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt"
+
+          exit 0
+
+      - name: Generate Swift interfaces and headers
+        env:
+          CACHE: ${{ steps.cache.outputs.cache_path }}
+        run: |
+          set +e
+
+          while IFS= read -r IMAGE; do
+
+            [ -n "$IMAGE" ] || continue
+
+            NAME="$(basename "$IMAGE")"
+
+            DEST="$GITHUB_WORKSPACE/reference/swift/$NAME"
+
+            mkdir -p "$DEST"
+
+            ipsw swift-dump \
+              "$CACHE" \
+              "$IMAGE" \
+              --headers \
+              --deps \
+              --extra \
+              --demangle \
+              -o "$DEST" \
+              > "$GITHUB_WORKSPACE/reference/swift/${NAME}_LOG.txt" \
+              2>&1
+
+          done < "$GITHUB_WORKSPACE/reference/manifests/CORE_IMAGES.txt"
+
+          exit 0
+
+      - name: Build direct dependency inventory
+        run: |
+          set -euo pipefail
+
+          grep -rhoE \
+            '/System/Library/PrivateFrameworks/[A-Za-z0-9_.+-]+\.framework/[A-Za-z0-9_.+-]+' \
+            "$GITHUB_WORKSPACE/reference/analysis" \
+          | sort -u \
+          > "$GITHUB_WORKSPACE/reference/dependencies/DIRECT_PRIVATE_DEPENDENCIES.txt" \
+          || true
+
+          echo
+          echo "=== DIRECT PRIVATE DEPENDENCIES ==="
+
+          cat \
+            "$GITHUB_WORKSPACE/reference/dependencies/DIRECT_PRIVATE_DEPENDENCIES.txt" \
+            || true
+
+      - name: Build Zoom cross-reference evidence
+        run: |
+          set -euo pipefail
+
+          grep -RinEi \
+            'PXZoomablePhotos|PXGZoomLayout|PXAlphaLayer|pinch|interactiveZoom|columnWidth|fromColumnIndex|toColumnIndex|anchor|settle|matchMove|prefetch|interactiveProgress|density|zoomStep' \
+            "$GITHUB_WORKSPACE/reference/analysis" \
+            "$GITHUB_WORKSPACE/reference/headers" \
+            "$GITHUB_WORKSPACE/reference/swift" \
+          > "$GITHUB_WORKSPACE/reference/dependencies/ZOOM_CROSS_REFERENCE_EVIDENCE.txt" \
+          || true
+
+          echo
+          echo "Cross-reference evidence lines:"
+
+          wc -l \
+            "$GITHUB_WORKSPACE/reference/dependencies/ZOOM_CROSS_REFERENCE_EVIDENCE.txt"
+
+      - name: Download latest Ghidra
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_JSON="$RUNNER_TEMP/ghidra-release.json"
+
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            > "$RELEASE_JSON"
+
+          GHIDRA_URL="$(
+            jq -r \
+              'first(
+                 .assets[]
+                 | select(
+                     .name
+                     | test("^ghidra_.*_PUBLIC_.*\\.zip$")
+                   )
+                 | .browser_download_url
+               ) // empty' \
+              "$RELEASE_JSON"
+          )"
+
+          if [ -z "$GHIDRA_URL" ]; then
+            echo "ERROR: Ghidra binary release asset not found."
+            cat "$RELEASE_JSON"
+            exit 1
+          fi
+
+          echo
+          echo "Downloading:"
+          echo "$GHIDRA_URL"
+
+          curl -fL \
+            "$GHIDRA_URL" \
+            -o "$RUNNER_TEMP/ghidra.zip"
+
+          mkdir -p "$RUNNER_TEMP/ghidra"
+
+          unzip -q \
+            "$RUNNER_TEMP/ghidra.zip" \
+            -d "$RUNNER_TEMP/ghidra"
+
+          GHIDRA_HOME="$(
+            find "$RUNNER_TEMP/ghidra" \
+              -maxdepth 1 \
+              -mindepth 1 \
+              -type d \
+              -print \
+              -quit
+          )"
+
+          if [ ! -x "$GHIDRA_HOME/support/analyzeHeadless" ]; then
+            echo "ERROR: analyzeHeadless not found."
+            exit 1
+          fi
+
+          echo "GHIDRA_HOME=$GHIDRA_HOME" \
+            >> "$GITHUB_ENV"
+
+          echo
+          echo "Ghidra home:"
+          echo "$GHIDRA_HOME"
+
+      - name: Create Ghidra Zoom pseudocode exporter
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/ghidra-scripts/ExportZoomPseudocode.java" <<'JAVA'
+          import ghidra.app.decompiler.DecompInterface;
+          import ghidra.app.decompiler.DecompileResults;
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.address.Address;
+          import ghidra.program.model.listing.Function;
+          import ghidra.program.model.listing.FunctionIterator;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileReader;
+          import java.io.PrintWriter;
+
+          import java.util.HashSet;
+          import java.util.Set;
+          import java.util.regex.Pattern;
+
+          public class ExportZoomPseudocode extends GhidraScript {
+
+              private static final Pattern TARGET_NAME =
+                  Pattern.compile(
+                      "(?i)(" +
+                      "zoom|" +
+                      "pinch|" +
+                      "interactive|" +
+                      "column|" +
+                      "anchor|" +
+                      "layout|" +
+                      "settle|" +
+                      "animat|" +
+                      "matchmove|" +
+                      "prefetch|" +
+                      "progress|" +
+                      "density|" +
+                      "oneup|" +
+                      "dismiss" +
+                      ")"
+                  );
+
+              @Override
+              public void run() throws Exception {
+
+                  String[] args = getScriptArgs();
+
+                  if (args.length < 2) {
+                      printerr(
+                          "Expected arguments: " +
+                          "<output-file> <address-file>"
+                      );
+                      return;
+                  }
+
+                  File outputFile =
+                      new File(args[0]);
+
+                  File addressFile =
+                      new File(args[1]);
+
+                  Set<String> explicitAddresses =
+                      new HashSet<>();
+
+                  if (addressFile.exists()) {
+
+                      try (
+                          BufferedReader reader =
+                              new BufferedReader(
+                                  new FileReader(addressFile)
+                              )
+                      ) {
+
+                          String line;
+
+                          while (
+                              (line = reader.readLine()) != null
+                          ) {
+
+                              line =
+                                  line.trim().toLowerCase();
+
+                              if (
+                                  line.startsWith("0x")
+                              ) {
+                                  explicitAddresses.add(
+                                      line.substring(2)
+                                  );
+                              }
+                          }
+                      }
+                  }
+
+                  DecompInterface decompiler =
+                      new DecompInterface();
+
+                  decompiler.toggleCCode(true);
+                  decompiler.toggleSyntaxTree(true);
+
+                  decompiler.setSimplificationStyle(
+                      "decompile"
+                  );
+
+                  decompiler.openProgram(
+                      currentProgram
+                  );
+
+                  Set<Function> targets =
+                      new HashSet<>();
+
+                  FunctionIterator functions =
+                      currentProgram
+                          .getFunctionManager()
+                          .getFunctions(true);
+
+                  while (
+                      functions.hasNext() &&
+                      !monitor.isCancelled()
+                  ) {
+
+                      Function function =
+                          functions.next();
+
+                      String name =
+                          function.getName();
+
+                      if (
+                          TARGET_NAME
+                              .matcher(name)
+                              .find()
+                      ) {
+                          targets.add(
+                              function
+                          );
+                      }
+                  }
+
+                  for (
+                      String hex :
+                      explicitAddresses
+                  ) {
+
+                      try {
+
+                          Address address =
+                              currentProgram
+                                  .getAddressFactory()
+                                  .getDefaultAddressSpace()
+                                  .getAddress(hex);
+
+                          if (
+                              address == null
+                          ) {
+                              continue;
+                          }
+
+                          Function function =
+                              currentProgram
+                                  .getFunctionManager()
+                                  .getFunctionContaining(
+                                      address
+                                  );
+
+                          if (
+                              function == null
+                          ) {
+                              function =
+                                  currentProgram
+                                      .getFunctionManager()
+                                      .getFunctionAt(
+                                          address
+                                      );
+                          }
+
+                          if (
+                              function != null
+                          ) {
+                              targets.add(
+                                  function
+                              );
+                          }
+
+                      } catch (
+                          Exception ignored
+                      ) {
+                      }
+                  }
+
+                  try (
+                      PrintWriter output =
+                          new PrintWriter(
+                              outputFile,
+                              "UTF-8"
+                          )
+                  ) {
+
+                      output.println(
+                          "PROGRAM: " +
+                          currentProgram.getName()
+                      );
+
+                      output.println(
+                          "IMAGE_BASE: " +
+                          currentProgram.getImageBase()
+                      );
+
+                      output.println(
+                          "TARGET_FUNCTION_COUNT: " +
+                          targets.size()
+                      );
+
+                      output.println();
+
+                      int index = 0;
+
+                      for (
+                          Function function :
+                          targets
+                      ) {
+
+                          if (
+                              monitor.isCancelled()
+                          ) {
+                              break;
+                          }
+
+                          index++;
+
+                          output.println(
+                              "============================================================"
+                          );
+
+                          output.println(
+                              "FUNCTION " +
+                              index +
+                              ": " +
+                              function.getName()
+                          );
+
+                          output.println(
+                              "ENTRY: " +
+                              function.getEntryPoint()
+                          );
+
+                          output.println(
+                              "SIGNATURE: " +
+                              function.getSignature()
+                          );
+
+                          output.println(
+                              "============================================================"
+                          );
+
+                          DecompileResults result =
+                              decompiler.decompileFunction(
+                                  function,
+                                  60,
+                                  monitor
+                              );
+
+                          if (
+                              result != null &&
+                              result.decompileCompleted() &&
+                              result.getDecompiledFunction() != null
+                          ) {
+
+                              output.println(
+                                  result
+                                      .getDecompiledFunction()
+                                      .getC()
+                              );
+
+                          } else {
+
+                              output.println(
+                                  "[DECOMPILATION FAILED]"
+                              );
+
+                              if (
+                                  result != null
+                              ) {
+                                  output.println(
+                                      result.getErrorMessage()
+                                  );
+                              }
+                          }
+
+                          output.println();
+                      }
+                  }
+
+                  decompiler.dispose();
+              }
+          }
+          JAVA
+
+      - name: Decompile extracted Zoom stack with Ghidra
+        run: |
+          set +e
+
+          ADDRESS_FILE="$GITHUB_WORKSPACE/reference/manifests/TARGET_IMP_ADDRESSES.txt"
+
+          INDEX=0
+
+          find "$GITHUB_WORKSPACE/reference/binaries" \
+            -type f \
+            -print0 \
+          | while IFS= read -r -d '' BINARY; do
+
+              if ! file "$BINARY" \
+                | grep -q 'Mach-O'
+              then
+                continue
+              fi
+
+              INDEX=$((INDEX + 1))
+
+              BASENAME="$(
+                basename "$BINARY"
+              )"
+
+              SAFE="$(
+                echo "$BASENAME" \
+                | tr -c 'A-Za-z0-9_.-' '_'
+              )"
+
+              PROJECT_NAME="photos_zoom_${INDEX}_${SAFE}"
+
+              PSEUDOCODE="$GITHUB_WORKSPACE/reference/decompiled/${SAFE}_PSEUDOCODE.c.txt"
+
+              LOG="$GITHUB_WORKSPACE/reference/decompiled/${SAFE}_GHIDRA_LOG.txt"
+
+              echo
+              echo "======================================"
+              echo "Ghidra: $BINARY"
+              echo "======================================"
+
+              timeout 900s \
+                "$GHIDRA_HOME/support/analyzeHeadless" \
+                  "$GITHUB_WORKSPACE/ghidra-projects" \
+                  "$PROJECT_NAME" \
+                  -import "$BINARY" \
+                  -overwrite \
+                  -analysisTimeoutPerFile 600 \
+                  -scriptPath "$GITHUB_WORKSPACE/ghidra-scripts" \
+                  -postScript \
+                    ExportZoomPseudocode.java \
+                    "$PSEUDOCODE" \
+                    "$ADDRESS_FILE" \
+                  > "$LOG" \
+                  2>&1
+
+          done
+
+          exit 0
+
+      - name: Build Zoom execution report
+        run: |
+          set -euo pipefail
+
+          REPORT="$GITHUB_WORKSPACE/reference/ZOOM_STACK_EXECUTION_REFERENCE.txt"
+
+          {
+            echo "APPLE PHOTOS ZOOM STACK EXECUTION REFERENCE"
+            echo
+            echo "Device: iPhone 11"
+            echo "Product: iPhone12,1"
+            echo "OS: iOS 27.0"
+            echo "Build: 24A437"
+            echo "Architecture: arm64e"
+            echo
+            echo "PRIMARY TARGETS:"
+            echo "PXZoomablePhotosLayout"
+            echo "PXGZoomLayout"
+            echo "PXZoomablePhotosAlphaAnimator"
+            echo "PXAlphaLayer"
+            echo
+            echo "BEHAVIOR TARGETS:"
+            echo "pinch"
+            echo "interactiveZoom"
+            echo "columnWidth"
+            echo "fromColumnIndex"
+            echo "toColumnIndex"
+            echo "anchor"
+            echo "layout"
+            echo "settle"
+            echo "animation"
+            echo "matchMove"
+            echo "prefetch"
+            echo "interactiveProgress"
+            echo
+            echo "TARGET IMP ADDRESS COUNT:"
+            wc -l \
+              "$GITHUB_WORKSPACE/reference/manifests/TARGET_IMP_ADDRESSES.txt" \
+              || true
+            echo
+            echo "DISCOVERED OWNERS:"
+            cat \
+              "$GITHUB_WORKSPACE/reference/manifests/DISCOVERED_OWNER_BASENAMES.txt" \
+              || true
+            echo
+            echo "DECOMPILED OUTPUTS:"
+            find \
+              "$GITHUB_WORKSPACE/reference/decompiled" \
+              -type f \
+              -name '*PSEUDOCODE*' \
+              -print \
+              || true
+            echo
+            echo "IMPORTANT:"
+            echo "Ghidra pseudocode is decompiler-generated."
+            echo "It is NOT Apple's original Objective-C/Swift source."
+            echo
+            echo "The ipsw disassembly files are the binary-ground-truth companion evidence."
+          } > "$REPORT"
+
+          cat "$REPORT"
+
+      - name: Validate core stack extraction
+        run: |
+          set -euo pipefail
+
+          STATUS="$GITHUB_WORKSPACE/reference/manifests/CORE_EXTRACTION_STATUS.txt"
+
+          REQUIRED=(
+            PhotosUICore
+            PhotosUIPrivate
+            GridZero
+            Tungsten
+            PhotosUIFoundation
+            PhotosSwiftUICore
+            PhotosUIComponents
+          )
+
+          FAILED=0
+
+          for NAME in "${REQUIRED[@]}"; do
+
+            if grep -Fxq \
+              "$NAME: EXTRACTED" \
+              "$STATUS"
+            then
+
+              echo "PASS: $NAME"
+
+            else
+
+              echo "FAIL: $NAME"
+              FAILED=1
+
+            fi
+
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Required core extraction incomplete."
+            exit 1
+          fi
+
+          echo
+          echo "CORE ZOOM STACK EXTRACTION PASS"
+
+      - name: Show final reference size
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "=== TOTAL SIZE ==="
+
+          du -sh \
+            "$GITHUB_WORKSPACE/reference"
+
+          echo
+          echo "=== LARGEST FILES ==="
+
+          find \
+            "$GITHUB_WORKSPACE/reference" \
+            -type f \
+            -printf '%s %p\n' \
+          | sort -nr \
+          | sed -n '1,40p' \
+          | numfmt \
+              --field=1 \
+              --to=iec
+
+      - name: Package Zoom execution reference
+        run: |
+          set -euo pipefail
+
+          cd \
+            "$GITHUB_WORKSPACE/reference"
+
+          zip -qry -9 \
+            "$GITHUB_WORKSPACE/Apple_Photos_Zoom_Execution_Reference_iOS27_24A437.zip" \
+            .
+
+          cd \
+            "$GITHUB_WORKSPACE"
+
+          sha256sum \
+            Apple_Photos_Zoom_Execution_Reference_iOS27_24A437.zip \
+            > Apple_Photos_Zoom_Execution_Reference_iOS27_24A437.zip.sha256
+
+          echo
+          echo "=== FINAL PACKAGE ==="
+
+          ls -lh \
+            Apple_Photos_Zoom_Execution_Reference_iOS27_24A437.zip
+
+          echo
+          echo "=== SHA-256 ==="
+
+          cat \
+            Apple_Photos_Zoom_Execution_Reference_iOS27_24A437.zip.sha256
+
+      - name: Upload Zoom execution reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: Apple_Photos_Zoom_Execution_Reference_iOS27_24A437
+          path: |
+            Apple_Photos_Zoom_Execution_Reference_iOS27_24A437.zip
+            Apple_Photos_Zoom_Execution_Reference_iOS27_24A437.zip.sha256
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Final disk space
+        if: always()
+        run: |
+          df -h
